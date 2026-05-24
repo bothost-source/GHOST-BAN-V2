@@ -34,9 +34,9 @@ function getPremiumList() { return loadPremiumDB().premium; }
 
 // ========== EMAIL ENGINE (from Telegram bot) ==========
 const GMAIL_ACCOUNTS = [
-  { user: process.env.GMAIL_1 || "destinyjob2007@gmail.com", pass: process.env.GMAIL_PASS_1 || "fdta vkdb mmhb quaa" },
-  { user: process.env.GMAIL_2 || "destinyjob493@gmail.com",      pass: process.env.GMAIL_PASS_2 || "cuyh xtef wcgp mlgr" },
-  { user: process.env.GMAIL_3 || "affiliatemarketingprogramm@gmail.com",   pass: process.env.GMAIL_PASS_3 || "golc mqlm ufip ssdz" },
+  { user: "destinyjob493@gmail.com",            pass: "pnnz fqzf kwpb njrc" },
+  { user: "destinyjob2007@gmail.com",           pass: "xcxz obdp apmp ohql" },
+  { user: "affiliatemarketingprogramm@gmail.com", pass: "yzqt qkkz jmug gkuj" },
 ];
 function pickGmail(i) { return GMAIL_ACCOUNTS[i % GMAIL_ACCOUNTS.length]; }
 
@@ -68,16 +68,46 @@ const getUnbanTemplates = require("./unban_templates");
 // ========== PROXIES ==========
 const PROXIES_ENABLED = process.env.USE_PROXIES === "1";
 function parseProxies(raw) {
-  return raw.split(/[\n,]+/).map(l => l.trim()).filter(Boolean)
-    .map(l => { const [h,p] = l.split(":"); return {host:h||"",port:parseInt(p||"80",10)}; })
+  return raw.split(/[\n]+/).map(l => l.trim()).filter(Boolean)
+    .map(l => {
+      // Handle format: "1,10,186,107;13629" -> "1.10.186.107:13629"
+      let clean = l;
+
+      // Replace semicolons with colons (port separator)
+      clean = clean.replace(/;/g, ':');
+
+      // Split by colon to separate IP and port
+      const parts = clean.split(':');
+      if (parts.length >= 2) {
+        // Replace commas with dots in the IP part only
+        const ip = parts[0].replace(/,/g, '.');
+        const port = parseInt(parts[parts.length - 1], 10);
+        return { host: ip, port: port };
+      }
+
+      // Fallback to original parsing
+      const [h, p] = l.split(':');
+      return { host: h || '', port: parseInt(p || '80', 10) };
+    })
     .filter(p => p.host && !isNaN(p.port));
 }
 function loadProxies() {
-  if (!PROXIES_ENABLED) return [];
+  if (!PROXIES_ENABLED) {
+    console.log(chalk.yellow('[PROXY] Proxies disabled. Set USE_PROXIES=1 to enable.'));
+    return [];
+  }
   const pf = path.join(__dirname,"proxy.txt");
-  if (fs.existsSync(pf)) { const l=parseProxies(fs.readFileSync(pf,"utf8")); if(l.length) return l; }
+  if (fs.existsSync(pf)) { 
+    const l=parseProxies(fs.readFileSync(pf,"utf8")); 
+    if(l.length) {
+      console.log(chalk.green(`[PROXY] Loaded ${l.length} proxies from proxy.txt`));
+      console.log(chalk.yellow(`[PROXY] First proxy: ${l[0].host}:${l[0].port}`));
+      return l; 
+    } 
+  }
   const e = process.env.PROXY_LIST||"";
   if (e.trim()) { const l=parseProxies(e); if(l.length) return l; }
+  console.log(chalk.red('[PROXY] USE_PROXIES=1 but no proxies found!'));
   return [];
 }
 const PROXIES = loadProxies();
@@ -98,7 +128,9 @@ function createProxiedSocket(proxy, host, port) {
 }
 
 // ========== SMTP ENGINE ==========
-const USE_PROXY_FOR_SMTP = process.env.USE_PROXY_FOR_SMTP === "1";
+// Proxies are OFF for SMTP by default because most HTTP proxies block SMTP ports.
+// Only enable if you have dedicated SOCKS5 or SMTP-compatible proxies.
+const USE_PROXY_FOR_SMTP = false; // process.env.USE_PROXY_FOR_SMTP === "1";
 const SMTP_CONFIGS = [
   { port: 465, secure: true  },
   { port: 587, secure: false },
@@ -141,14 +173,20 @@ async function trySendOnce(cfg, acct, to, subject, body, proxy) {
 async function sendEmail(to, subject, body, proxy, accountIdx) {
   const acct = pickGmail(accountIdx || 0);
   let lastErr;
+
+  // Log which account is being used
+  console.log(`[SMTP] Using account: ${acct.user} -> target: ${to}`);
+
   for (let attempt = 0; attempt < SMTP_CONFIGS.length; attempt++) {
     const cfg = SMTP_CONFIGS[(preferredSmtpIdx + attempt) % SMTP_CONFIGS.length];
     try {
       await trySendOnce(cfg, acct, to, subject, body, proxy);
       preferredSmtpIdx = (preferredSmtpIdx + attempt) % SMTP_CONFIGS.length;
+      console.log(`[SMTP] SUCCESS: ${to} via port ${cfg.port}`);
       return;
     } catch (e) {
       lastErr = e;
+      console.error(`[SMTP] FAILED port ${cfg.port}: ${e.code || ''} ${e.message || e.response || ''}`);
       if (!isConnectionError(e)) throw e;
     }
   }
@@ -285,6 +323,52 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(), 
         campaigns: activeCampaigns.size,
         version: 'Ghost Ban Web v2.0'
+    });
+});
+
+// SMTP Test endpoint - test one Gmail account
+app.post('/api/test-smtp', requireAuth, async (req, res) => {
+    const { accountIndex = 0 } = req.body;
+    const acct = GMAIL_ACCOUNTS[accountIndex] || GMAIL_ACCOUNTS[0];
+
+    if (!acct) return res.status(400).json({ error: 'No Gmail account configured' });
+
+    const results = [];
+
+    for (const cfg of SMTP_CONFIGS) {
+        const t = nodemailer.createTransport({
+            host: "smtp.gmail.com",
+            port: cfg.port,
+            secure: cfg.secure,
+            auth: { user: acct.user, pass: acct.pass },
+            tls: { rejectUnauthorized: false },
+            connectionTimeout: 10000,
+            greetingTimeout: 10000,
+            socketTimeout: 15000,
+        });
+
+        try {
+            await t.verify();
+            results.push({ port: cfg.port, secure: cfg.secure, status: 'OK' });
+        } catch (e) {
+            results.push({ 
+                port: cfg.port, 
+                secure: cfg.secure, 
+                status: 'FAIL',
+                code: e.code || '',
+                message: e.message || '',
+                response: e.response || ''
+            });
+        } finally {
+            try { t.close(); } catch {}
+        }
+    }
+
+    res.json({
+        account: acct.user,
+        accountIndex,
+        results,
+        canSend: results.some(r => r.status === 'OK')
     });
 });
 
